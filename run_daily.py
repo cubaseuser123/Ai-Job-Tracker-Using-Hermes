@@ -195,6 +195,7 @@ def discover_urls_for_company(company):
     search_queries = [
         f'"{name}" intern AI engineer site:linkedin.com/jobs',
         f'"{name}" intern site:wellfound.com',
+        f'"{name}" intern site:workatastartup.com OR site:instahyre.com OR site:cutshort.io',
         f'"{name}" intern site:boards.greenhouse.io OR site:jobs.lever.co',
     ]
 
@@ -210,6 +211,9 @@ def discover_urls_for_company(company):
                 elif "lever.co" in url: source = "Lever"
                 elif "ashbyhq.com" in url: source = "Ashby"
                 elif "internshala.com" in url: source = "Internshala"
+                elif "workatastartup.com" in url: source = "YC WorkAtAStartup"
+                elif "instahyre.com" in url: source = "Instahyre"
+                elif "cutshort.io" in url: source = "Cutshort"
                 urls.append((source, url))
 
     return urls
@@ -423,53 +427,64 @@ def phase_2(skill_prompt):
     existing = {c["name"].lower() for c in get_companies()}
     discovered = 0
 
-    for query in DISCOVERY_QUERIES:
-        print(f"\n🌐 Searching: {query}")
-        results = smart_search(query, max_results=5)
-
-        for r in results:
-            url = r.get("url", "")
-            title = r.get("title", "")
-            snippet = r.get("content", "")
-
-            if not any(kw in (title + snippet).lower() for kw in ["intern", "ai", "llm", "engineer"]):
-                continue
-
-            pseudo_name = title.split(" - ")[0].split(" | ")[0].strip()[:50]
-            if pseudo_name.lower() in existing:
-                continue
-
-            print(f"  🔎 Evaluating: {title[:80]}...")
-            content = smart_fetch(url)
-            if not content or not has_internship_signals(content):
-                continue
-
-            source = "web search"
-            data = _extract_discovery(content, url, source, skill_prompt)
-
-            if data and data.get("found"):
-                company_name = data.get("company_name", pseudo_name)
-                
-                manager = data.get("hiring_manager")
-                if not manager:
-                    print(f"  🕵️ Launching Insider Recon for {company_name}...")
-                    recon_query = f'"{company_name}" (engineering manager OR technical recruiter) site:linkedin.com/in'
-                    recon_results = smart_search(recon_query, max_results=2)
-                    if recon_results:
-                        insiders = [rr.get('title', '').split(' - ')[0] for rr in recon_results]
-                        if insiders:
-                            added_note = "Insider Targets: " + ", ".join(insiders)
-                            existing_notes = data.get("edge_notes", "")
-                            data["edge_notes"] = f"{existing_notes} | {added_note}".strip(" |")
-                            print(f"  🎯 Found Insiders: {', '.join(insiders)}")
-
-                print(f"  ✅ DISCOVERED: {data.get('role_title')} @ {company_name}")
-                os.system(f'python db_tool.py add-company --name "{company_name}" --location "{data.get("location", "Unknown")}" --domain "AI Engineering" --career-url "{url}"')
-                _log_via_cli(data)
-                existing.add(company_name.lower())
-                discovered += 1
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(_process_discovery_query, q, existing, skill_prompt) for q in DISCOVERY_QUERIES]
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                discovered += future.result()
+            except Exception as e:
+                print(f"  ❌ Error in Wild Hunt query: {e}")
 
     return discovered
+
+def _process_discovery_query(query, existing, skill_prompt):
+    print(f"\n🌐 Searching: {query}")
+    results = smart_search(query, max_results=5)
+    found_count = 0
+
+    for r in results:
+        url = r.get("url", "")
+        title = r.get("title", "")
+        snippet = r.get("content", "")
+
+        if not any(kw in (title + snippet).lower() for kw in ["intern", "ai", "llm", "engineer"]):
+            continue
+
+        pseudo_name = title.split(" - ")[0].split(" | ")[0].strip()[:50]
+        if pseudo_name.lower() in existing:
+            continue
+
+        print(f"  🔎 Evaluating: {title[:80]}...")
+        content = smart_fetch(url)
+        if not content or not has_internship_signals(content):
+            continue
+
+        source = "web search"
+        data = _extract_discovery(content, url, source, skill_prompt)
+
+        if data and data.get("found"):
+            company_name = data.get("company_name", pseudo_name)
+            
+            manager = data.get("hiring_manager")
+            if not manager:
+                print(f"  🕵️ Launching Insider Recon for {company_name}...")
+                recon_query = f'"{company_name}" (engineering manager OR technical recruiter) site:linkedin.com/in'
+                recon_results = smart_search(recon_query, max_results=2)
+                if recon_results:
+                    insiders = [rr.get('title', '').split(' - ')[0] for rr in recon_results]
+                    if insiders:
+                        added_note = "Insider Targets: " + ", ".join(insiders)
+                        existing_notes = data.get("edge_notes", "")
+                        data["edge_notes"] = f"{existing_notes} | {added_note}".strip(" |")
+                        print(f"  🎯 Found Insiders: {', '.join(insiders)}")
+
+            print(f"  ✅ DISCOVERED: {data.get('role_title')} @ {company_name}")
+            os.system(f'python db_tool.py add-company --name "{company_name}" --location "{data.get("location", "Unknown")}" --domain "AI Engineering" --career-url "{url}"')
+            _log_via_cli(data)
+            existing.add(company_name.lower())
+            found_count += 1
+
+    return found_count
 
 def _extract_discovery(content, url, source, skill_prompt):
     prompt = f"""{skill_prompt}
@@ -594,25 +609,29 @@ Write a strict, 1-2 sentence rule in markdown format (starting with "- CRITICAL:
 
 def run_daily(phase_filter=None):
     print(f"\n{'🌅' * 20}")
-    print(f"  HERMES DAILY RUN (Hybrid Waterfall) — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"  HERMES DAILY RUN (V2.1 Concurrent Swarm) — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"{'🌅' * 20}\n")
 
     skill_prompt = load_skill_prompt()
     total = 0
 
-    if phase_filter is None or phase_filter == 1:
-        p1_count = phase_1(skill_prompt)
-        total += p1_count
-        print(f"\n📊 Phase 1 complete: {p1_count} openings found.")
-
-    if phase_filter is None or phase_filter == 2:
-        if total < MIN_OPENINGS_THRESHOLD:
-            print(f"\n⚡ Phase 1 yield ({total}) below threshold ({MIN_OPENINGS_THRESHOLD}). Activating Wild Hunt...")
-            p2_count = phase_2(skill_prompt)
-            total += p2_count
-            print(f"\n📊 Phase 2 complete: {p2_count} new discoveries.")
-        else:
-            print(f"\n✅ Phase 1 yield ({total}) meets threshold. Skipping Phase 2.")
+    if phase_filter is None:
+        print("\n🚀 Activating Concurrent Swarm (Phase 1 & Phase 2 simultaneously)...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            future_p1 = executor.submit(phase_1, skill_prompt)
+            future_p2 = executor.submit(phase_2, skill_prompt)
+            
+            try:
+                p1_count = future_p1.result()
+                p2_count = future_p2.result()
+                total += (p1_count + p2_count)
+            except Exception as e:
+                print(f"  ❌ Error in Concurrent Swarm: {e}")
+    else:
+        if phase_filter == 1:
+            total += phase_1(skill_prompt)
+        elif phase_filter == 2:
+            total += phase_2(skill_prompt)
             
     if phase_filter is None or phase_filter == 3:
         phase_3_reflection()
