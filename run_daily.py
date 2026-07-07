@@ -32,10 +32,28 @@ SKILL_PATH = Path("hermes_skill.md")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
 FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY", "")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
 MIN_OPENINGS_THRESHOLD = 10
 
 gemma_lock = threading.Lock()
+error_log_lock = threading.Lock()
+
+def log_error(company_name, raw_output, error_msg):
+    with error_log_lock:
+        try:
+            with open("errors.json", "r", encoding="utf-8") as f:
+                errors = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            errors = []
+        errors.append({
+            "company": company_name,
+            "raw_output": raw_output,
+            "error": str(error_msg),
+            "timestamp": datetime.now().isoformat()
+        })
+        with open("errors.json", "w", encoding="utf-8") as f:
+            json.dump(errors, f, indent=2)
 
 # ---------------------------------------------------------------------------
 # Database helpers
@@ -202,7 +220,15 @@ def discover_urls_for_company(company):
 
 def load_skill_prompt():
     with open(SKILL_PATH, "r", encoding="utf-8") as f:
-        return f.read()
+        skill = f.read()
+    try:
+        with open("memory.md", "r", encoding="utf-8") as f:
+            memory = f.read()
+            if memory.strip():
+                skill += "\n\n### PERSISTENT MEMORY / RULES\n" + memory
+    except FileNotFoundError:
+        pass
+    return skill
 
 def extract_with_gemma(content, company, url, source, skill_prompt):
     name = company["name"] if type(company) != str else company
@@ -284,15 +310,21 @@ If no valid matching opening exists, set "found" to false and leave other fields
         
         try:
             data = json.loads(raw)
-        except json.JSONDecodeError:
+            return data
+        except json.JSONDecodeError as e:
             # Fallback robust regex extraction for {} blocks
             match = re.search(r'\{.*\}', raw, re.DOTALL)
             if match:
-                data = json.loads(match.group(0))
+                try:
+                    data = json.loads(match.group(0))
+                    return data
+                except Exception as ex:
+                    log_error(name, raw, f"Regex fallback failed: {ex}")
+                    raise ValueError(f"Could not parse JSON: {raw[:100]}")
             else:
+                log_error(name, raw, f"JSON decode error: {e}")
                 raise ValueError(f"Could not parse JSON: {raw[:100]}")
                 
-        return data
     except Exception as e:
         print(f"  [{name}] Gemma extraction failed: {e}")
         return None
@@ -434,9 +466,15 @@ If no valid matching opening exists, set "found" to false.
         raw = raw.strip()
         try:
             return json.loads(raw)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
             match = re.search(r'\{.*\}', raw, re.DOTALL)
-            if match: return json.loads(match.group(0))
+            if match: 
+                try:
+                    return json.loads(match.group(0))
+                except:
+                    log_error(source, raw, f"Regex fallback failed in discovery")
+            else:
+                log_error(source, raw, f"JSON decode error in discovery: {e}")
             return None
     except:
         return None
@@ -466,6 +504,63 @@ def _log_via_cli(data):
     os.system(cmd)
 
 # ---------------------------------------------------------------------------
+# Phase 3: Claude Supervisor Reflection
+# ---------------------------------------------------------------------------
+
+def phase_3_reflection():
+    print("\n" + "=" * 60)
+    print("  PHASE 3: Claude Supervisor Reflection")
+    print("=" * 60)
+    
+    if not ANTHROPIC_API_KEY:
+        print("  ❌ No Anthropic API Key found. Skipping reflection.")
+        return
+        
+    try:
+        with open("errors.json", "r", encoding="utf-8") as f:
+            errors = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        print("  ✅ No extraction errors logged today. Memory is stable.")
+        return
+        
+    if not errors:
+        print("  ✅ No extraction errors logged today. Memory is stable.")
+        return
+
+    print(f"  🧠 Found {len(errors)} errors. Consulting Claude 3.5 Haiku...")
+    
+    prompt = f"""You are the Supervisor for an autonomous AI web scraper. 
+Your local LLM agent made the following JSON extraction errors today:
+{json.dumps(errors, indent=2)}
+
+Analyze WHY the local model failed to output valid JSON. Did it hallucinate conversational text? Did it truncate? Did it include markdown wrappers?
+
+Write a strict, 1-2 sentence rule in markdown format (starting with "- CRITICAL: ") that will be appended to the local model's system prompt to ensure it NEVER makes this specific formatting mistake again. Do not output anything other than the new rules."""
+
+    try:
+        from anthropic import Anthropic
+        client = Anthropic(api_key=ANTHROPIC_API_KEY)
+        response = client.messages.create(
+            model="claude-3-5-haiku-latest",
+            max_tokens=200,
+            temperature=0.0,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        new_rules = response.content[0].text.strip()
+        
+        with open("memory.md", "a", encoding="utf-8") as f:
+            f.write("\n" + new_rules + "\n")
+            
+        print(f"  📝 New Rules Added to Memory:\n{new_rules}")
+        
+        # Clear errors for next run
+        with open("errors.json", "w", encoding="utf-8") as f:
+            json.dump([], f)
+            
+    except Exception as e:
+        print(f"  ❌ Reflection failed: {e}")
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -490,6 +585,9 @@ def run_daily(phase_filter=None):
             print(f"\n📊 Phase 2 complete: {p2_count} new discoveries.")
         else:
             print(f"\n✅ Phase 1 yield ({total}) meets threshold. Skipping Phase 2.")
+            
+    if phase_filter is None or phase_filter == 3:
+        phase_3_reflection()
 
     print(f"\n{'=' * 60}")
     print(f"  TOTAL: {total} openings logged today.")
@@ -498,7 +596,7 @@ def run_daily(phase_filter=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Hermes Daily Runner")
-    parser.add_argument("--phase", type=int, choices=[1, 2], help="Run only a specific phase")
+    parser.add_argument("--phase", type=int, choices=[1, 2, 3], help="Run only a specific phase")
     parser.add_argument("--report", action="store_true", help="Just show today's report")
     args = parser.parse_args()
 
