@@ -282,6 +282,7 @@ Return ONLY a valid JSON object with these keys:
 - "match_reason": string
 - "dsa_level": "None" | "Light" | "Medium" | "Heavy"
 - "edge_notes": string
+- "hiring_manager": string or null
 
 If no valid matching opening exists, set "found" to false and leave other fields empty.
 """
@@ -380,6 +381,19 @@ def _process_company(c, skill_prompt):
                 print(f"  ♻️  Duplicate: {role}")
                 continue
             seen_roles.add(dedup_key)
+            
+            manager = data.get("hiring_manager")
+            if not manager:
+                print(f"  🕵️ Launching Insider Recon for {name}...")
+                recon_query = f'"{name}" (engineering manager OR technical recruiter) site:linkedin.com/in'
+                recon_results = smart_search(recon_query, max_results=2)
+                if recon_results:
+                    insiders = [rr.get('title', '').split(' - ')[0] for rr in recon_results]
+                    if insiders:
+                        added_note = "Insider Targets: " + ", ".join(insiders)
+                        existing_notes = data.get("edge_notes", "")
+                        data["edge_notes"] = f"{existing_notes} | {added_note}".strip(" |")
+                        print(f"  🎯 Found Insiders: {', '.join(insiders)}")
 
             print(f"  ✅ FOUND: {role}")
             _log_via_cli(data)
@@ -435,6 +449,20 @@ def phase_2(skill_prompt):
 
             if data and data.get("found"):
                 company_name = data.get("company_name", pseudo_name)
+                
+                manager = data.get("hiring_manager")
+                if not manager:
+                    print(f"  🕵️ Launching Insider Recon for {company_name}...")
+                    recon_query = f'"{company_name}" (engineering manager OR technical recruiter) site:linkedin.com/in'
+                    recon_results = smart_search(recon_query, max_results=2)
+                    if recon_results:
+                        insiders = [rr.get('title', '').split(' - ')[0] for rr in recon_results]
+                        if insiders:
+                            added_note = "Insider Targets: " + ", ".join(insiders)
+                            existing_notes = data.get("edge_notes", "")
+                            data["edge_notes"] = f"{existing_notes} | {added_note}".strip(" |")
+                            print(f"  🎯 Found Insiders: {', '.join(insiders)}")
+
                 print(f"  ✅ DISCOVERED: {data.get('role_title')} @ {company_name}")
                 os.system(f'python db_tool.py add-company --name "{company_name}" --location "{data.get("location", "Unknown")}" --domain "AI Engineering" --career-url "{url}"')
                 _log_via_cli(data)
@@ -450,7 +478,7 @@ def _extract_discovery(content, url, source, skill_prompt):
 {content[:15000]}
 ---
 **Instructions:** Analyze this page for AI Engineering internship openings matching the Candidate Profile.
-Return ONLY a valid JSON object with the expected keys (found, role_title, company_name, etc).
+Return ONLY a valid JSON object with the expected keys (found, role_title, company_name, edge_notes, hiring_manager, etc).
 If no valid matching opening exists, set "found" to false.
 """
     payload = {"model": "qwen2.5:7b", "prompt": prompt, "stream": False, "format": "json"}
