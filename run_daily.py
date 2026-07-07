@@ -137,6 +137,10 @@ def smart_fetch(url):
     Tier 1: Jina Reader (Free, Fast, Zero local compute)
     Tier 2: Firecrawl (Paid, Fallback)
     """
+    if "linkedin.com" in url:
+        print(f"  [Fetch] Skipping deep fetch for {url} (LinkedIn anti-scraping active).")
+        return None
+
     print(f"  [Fetch] Using Jina Reader for: {url}")
     try:
         response = requests.get(f"https://r.jina.ai/{url}", timeout=30)
@@ -200,11 +204,11 @@ def discover_urls_for_company(company):
 
     career_url = safe_get(company, "career_url")
     if career_url.startswith("http"):
-        urls.append(("careers page", career_url))
+        urls.append(("careers page", career_url, ""))
 
     portal = safe_get(company, "portal")
     if portal and "http" in portal:
-        urls.append(("portal", portal))
+        urls.append(("portal", portal, ""))
 
     search_queries = [
         f'"{name}" intern AI engineer site:linkedin.com/jobs',
@@ -228,7 +232,8 @@ def discover_urls_for_company(company):
                 elif "workatastartup.com" in url: source = "YC WorkAtAStartup"
                 elif "instahyre.com" in url: source = "Instahyre"
                 elif "cutshort.io" in url: source = "Cutshort"
-                urls.append((source, url))
+                snippet = r.get("title", "") + "\n" + r.get("content", "")
+                urls.append((source, url, snippet))
 
     return urls
 
@@ -352,13 +357,8 @@ If no valid matching opening exists, set "found" to false and leave other fields
 # LLM Verification via Gemini
 # ---------------------------------------------------------------------------
 
-from google import genai
-from google.genai import types
-import threading
 import time
 
-gemini_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
-gemini_lock = threading.Lock()
 
 def verify_with_gemini(content, qwen_data):
     if not gemini_client:
@@ -434,10 +434,15 @@ def _process_company(c, skill_prompt):
 
     seen_roles = set()
 
-    for source, url in urls:
+    for source, url, snippet in urls:
         content = smart_fetch(url)
         if not content:
-            continue
+            if snippet:
+                print(f"  [Fallback] Using search snippet for {source}")
+                content = snippet
+            else:
+                continue
+                
         if not has_internship_signals(content):
             print(f"  No internship signals on {source}.")
             continue
@@ -525,7 +530,11 @@ def _process_discovery_query(query, existing, skill_prompt):
 
         print(f"  🔎 Evaluating: {title[:80]}...")
         content = smart_fetch(url)
-        if not content or not has_internship_signals(content):
+        if not content:
+            print(f"  [Fallback] Using search snippet for web search")
+            content = f"{title}\n{snippet}"
+            
+        if not has_internship_signals(content):
             continue
 
         source = "web search"
