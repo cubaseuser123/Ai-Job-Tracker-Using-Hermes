@@ -23,6 +23,12 @@ import requests
 from dotenv import load_dotenv
 import threading
 import concurrent.futures
+import anthropic
+try:
+    from google import genai
+    from google.genai import types
+except ImportError:
+    genai = None
 
 load_dotenv()
 
@@ -38,6 +44,14 @@ MIN_OPENINGS_THRESHOLD = 10
 
 gemma_lock = threading.Lock()
 error_log_lock = threading.Lock()
+gemini_lock = threading.Lock()
+
+gemini_client = None
+if genai:
+    try:
+        gemini_client = genai.Client(vertexai=True, project="claudewithcredits", location="us-central1")
+    except Exception as e:
+        pass
 
 def log_error(company_name, raw_output, error_msg):
     with error_log_lock:
@@ -335,6 +349,57 @@ If no valid matching opening exists, set "found" to false and leave other fields
         return None
 
 # ---------------------------------------------------------------------------
+# LLM Verification via Gemini
+# ---------------------------------------------------------------------------
+
+from google import genai
+from google.genai import types
+import threading
+import time
+
+gemini_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+gemini_lock = threading.Lock()
+
+def verify_with_gemini(content, qwen_data):
+    if not gemini_client:
+        return True
+        
+    prompt = f"""You are the strict secondary verifier. The local model extracted this JSON job data from the following webpage:
+    
+JSON Data:
+{json.dumps(qwen_data, indent=2)}
+
+Webpage (Truncated):
+{content[:15000]}
+
+Is this ACTUALLY a valid internship matching the JSON data? Look out for hallucinations where the local model extracted a "Senior" or "Full-Time" role by mistake.
+Return ONLY a valid JSON object with:
+{{
+  "verified": true or false,
+  "reason": "short explanation of why it is valid or invalid"
+}}
+"""
+    try:
+        with gemini_lock:
+            time.sleep(4.1) # 429 Quota protection
+            response = gemini_client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.0,
+                ),
+            )
+            data = json.loads(response.text)
+            if not data.get("verified", False):
+                print(f"  ❌ Gemini Rejected: {data.get('reason')}")
+                return False
+            return True
+    except Exception as e:
+        print(f"  ⚠️ Gemini Verification failed: {e}")
+        return True # Default to trusting local model on API error
+
+# ---------------------------------------------------------------------------
 # Phase 1: Seeded Company Sweep
 # ---------------------------------------------------------------------------
 
@@ -379,6 +444,10 @@ def _process_company(c, skill_prompt):
 
         data = extract_with_gemma(content, c, url, source, skill_prompt)
         if data and data.get("found"):
+            print(f"  🛡️ Verifying with Gemini 2.5 Flash...")
+            if not verify_with_gemini(content, data):
+                continue
+                
             role = data.get("role_title", "Unknown Role")
             dedup_key = f"{name}|{role}"
             if dedup_key in seen_roles:
@@ -463,6 +532,10 @@ def _process_discovery_query(query, existing, skill_prompt):
         data = _extract_discovery(content, url, source, skill_prompt)
 
         if data and data.get("found"):
+            print(f"  🛡️ Verifying with Gemini 2.5 Flash...")
+            if not verify_with_gemini(content, data):
+                continue
+                
             company_name = data.get("company_name", pseudo_name)
             
             manager = data.get("hiring_manager")
@@ -584,7 +657,7 @@ Write a strict, 1-2 sentence rule in markdown format (starting with "- CRITICAL:
         from anthropic import Anthropic
         client = Anthropic(api_key=ANTHROPIC_API_KEY)
         response = client.messages.create(
-            model="claude-3-5-haiku-latest",
+            model="claude-3-5-sonnet-latest",
             max_tokens=200,
             temperature=0.0,
             messages=[{"role": "user", "content": prompt}]
