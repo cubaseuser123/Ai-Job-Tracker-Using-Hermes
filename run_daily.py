@@ -383,7 +383,7 @@ Return ONLY a valid JSON object with:
         with gemini_lock:
             time.sleep(4.1) # 429 Quota protection
             response = gemini_client.models.generate_content(
-                model="gemini-2.0-flash",
+                model="gemini-2.5-flash",
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
@@ -518,6 +518,11 @@ def _process_discovery_query(query, existing, skill_prompt):
 
     for r in results:
         url = r.get("url", "")
+        
+        blocklist = ["medium.com", "glassdoor", "naukri", "indeed", "getpersonalisedcv.in", "/blog", "prosple", "internshala.com", "vgoodslab.com"]
+        if any(b in url.lower() for b in blocklist):
+            continue
+            
         title = r.get("title", "")
         snippet = r.get("content", "")
 
