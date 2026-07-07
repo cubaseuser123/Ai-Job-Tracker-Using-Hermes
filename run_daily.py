@@ -232,7 +232,7 @@ def load_skill_prompt():
 
 def extract_with_gemma(content, company, url, source, skill_prompt):
     name = company["name"] if type(company) != str else company
-    print(f"  [{name}] Extracting via Gemma 3 ({source})...")
+    print(f"  [{name}] Extracting via Qwen 2.5 7B ({source})...")
 
     company_context = "No prior intel available."
     if type(company) != str:
@@ -264,7 +264,7 @@ def extract_with_gemma(content, company, url, source, skill_prompt):
 
 ### 📄 Page Content (from {source}: {url})
 ---
-{content[:55000]}
+{content[:15000]}
 ---
 
 **Instructions:** Analyze this page for internship openings matching the Candidate Profile. 
@@ -287,7 +287,7 @@ If no valid matching opening exists, set "found" to false and leave other fields
 """
 
     payload = {
-        "model": "gemma3:4b",
+        "model": "qwen2.5:7b",
         "prompt": prompt,
         "stream": False,
         "format": "json",
@@ -326,7 +326,7 @@ If no valid matching opening exists, set "found" to false and leave other fields
                 raise ValueError(f"Could not parse JSON: {raw[:100]}")
                 
     except Exception as e:
-        print(f"  [{name}] Gemma extraction failed: {e}")
+        print(f"  [{name}] Qwen extraction failed: {e}")
         return None
 
 # ---------------------------------------------------------------------------
@@ -447,13 +447,13 @@ def _extract_discovery(content, url, source, skill_prompt):
     prompt = f"""{skill_prompt}
 ### 📄 Page Content (from {source}: {url})
 ---
-{content[:55000]}
+{content[:15000]}
 ---
 **Instructions:** Analyze this page for AI Engineering internship openings matching the Candidate Profile.
 Return ONLY a valid JSON object with the expected keys (found, role_title, company_name, etc).
 If no valid matching opening exists, set "found" to false.
 """
-    payload = {"model": "gemma3:4b", "prompt": prompt, "stream": False, "format": "json"}
+    payload = {"model": "qwen2.5:7b", "prompt": prompt, "stream": False, "format": "json"}
     try:
         with gemma_lock:
             response = requests.post(OLLAMA_URL, json=payload, timeout=120)
