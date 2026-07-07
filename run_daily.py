@@ -21,6 +21,8 @@ from pathlib import Path
 from datetime import datetime
 import requests
 from dotenv import load_dotenv
+import threading
+import concurrent.futures
 
 load_dotenv()
 
@@ -32,6 +34,8 @@ FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY", "")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
 
 MIN_OPENINGS_THRESHOLD = 10
+
+gemma_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Database helpers
@@ -264,9 +268,10 @@ If no valid matching opening exists, set "found" to false and leave other fields
     }
 
     try:
-        response = requests.post(OLLAMA_URL, json=payload, timeout=120)
-        response.raise_for_status()
-        raw = response.json().get("response", "").strip()
+        with gemma_lock:
+            response = requests.post(OLLAMA_URL, json=payload, timeout=120)
+            response.raise_for_status()
+            raw = response.json().get("response", "").strip()
         
         # Clean markdown codeblock formatting if Gemma hallucinated it
         if raw.startswith("```json"):
@@ -304,43 +309,53 @@ def phase_1(skill_prompt):
     companies = get_companies()
     openings_found = 0
 
-    for c in companies:
-        name = c["name"]
-        print(f"\n🔍 [{name}] (Tier: {c['tier']})")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(_process_company, c, skill_prompt) for c in companies]
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                openings_found += future.result()
+            except Exception as e:
+                print(f"  ❌ Error processing company: {e}")
 
-        urls = discover_urls_for_company(c)
-        if not urls:
-            print(f"  No URLs found for {name}.")
-            update_last_checked(name)
+    return openings_found
+
+def _process_company(c, skill_prompt):
+    name = c["name"]
+    print(f"\n🔍 [{name}] (Tier: {c['tier']})")
+    
+    openings_found = 0
+    urls = discover_urls_for_company(c)
+    if not urls:
+        print(f"  No URLs found for {name}.")
+        update_last_checked(name)
+        return openings_found
+
+    seen_roles = set()
+
+    for source, url in urls:
+        content = smart_fetch(url)
+        if not content:
+            continue
+        if not has_internship_signals(content):
+            print(f"  No internship signals on {source}.")
             continue
 
-        seen_roles = set()
-
-        for source, url in urls:
-            content = smart_fetch(url)
-            if not content:
+        data = extract_with_gemma(content, c, url, source, skill_prompt)
+        if data and data.get("found"):
+            role = data.get("role_title", "Unknown Role")
+            dedup_key = f"{name}|{role}"
+            if dedup_key in seen_roles:
+                print(f"  ♻️  Duplicate: {role}")
                 continue
-            if not has_internship_signals(content):
-                print(f"  No internship signals on {source}.")
-                continue
+            seen_roles.add(dedup_key)
 
-            data = extract_with_gemma(content, c, url, source, skill_prompt)
-            if data and data.get("found"):
-                role = data.get("role_title", "Unknown Role")
-                dedup_key = f"{name}|{role}"
-                if dedup_key in seen_roles:
-                    print(f"  ♻️  Duplicate: {role}")
-                    continue
-                seen_roles.add(dedup_key)
+            print(f"  ✅ FOUND: {role}")
+            _log_via_cli(data)
+            openings_found += 1
+        else:
+            print(f"  No matching openings on {source}.")
 
-                print(f"  ✅ FOUND: {role}")
-                _log_via_cli(data)
-                openings_found += 1
-            else:
-                print(f"  No matching openings on {source}.")
-
-        update_last_checked(name)
-
+    update_last_checked(name)
     return openings_found
 
 # ---------------------------------------------------------------------------
@@ -408,9 +423,11 @@ If no valid matching opening exists, set "found" to false.
 """
     payload = {"model": "gemma3:4b", "prompt": prompt, "stream": False, "format": "json"}
     try:
-        response = requests.post(OLLAMA_URL, json=payload, timeout=120)
-        response.raise_for_status()
-        raw = response.json().get("response", "").strip()
+        with gemma_lock:
+            response = requests.post(OLLAMA_URL, json=payload, timeout=120)
+            response.raise_for_status()
+            raw = response.json().get("response", "").strip()
+        
         if raw.startswith("```json"): raw = raw[7:]
         elif raw.startswith("```"): raw = raw[3:]
         if raw.endswith("```"): raw = raw[:-3]
